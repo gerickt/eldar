@@ -1,18 +1,126 @@
 from unidecode import unidecode
+from lark import Lark, Transformer, Token
+from .entry import Entry, ProximityEntry
+from .operators import AND, OR, NOT, ANDNOT
 import re
 from .regex import WORD_REGEX
-from .entry import Entry
-from .operators import AND, ANDNOT, OR
+
+grammar = r"""
+%import common.NUMBER
+%import common.WS_INLINE
+%ignore WS_INLINE
+
+%left OR
+%left AND
+%left NOT
+%left PROX
+
+?start: expr
+
+?expr: expr OR expr           -> or_op
+     | expr AND expr          -> and_op
+     | expr NOT expr          -> and_not_op
+     | term
+
+?term: NOT term               -> not_op
+     | term PROX term         -> proximity_op
+     | QUOTED_STRING          -> quoted_term
+     | WORD                   -> word_term
+     | "(" expr ")"           -> group
+
+AND: /AND/i
+OR: /OR/i
+NOT: "-"
+PROX: "/" NUMBER
+
+WORD: /[^()\s"\/-]+/
+QUOTED_STRING: "\"" /.*?(?<!\\)"/
+"""
+
+
+class QueryTransformer(Transformer):
+    def __init__(self, ignore_case=True, ignore_accent=True):
+        super().__init__()
+        self.ignore_case = ignore_case
+        self.ignore_accent = ignore_accent
+
+    def start(self, args):
+        return args[0]
+
+    def expr(self, args):
+        return args[0]
+
+    def or_op(self, args):
+        left, right = args
+        return OR(left, right)
+
+    def and_op(self, args):
+        left, right = args
+        return AND(left, right)
+
+    def and_not_op(self, args):
+        left, right = args
+        return ANDNOT(left, right)
+
+    def not_op(self, args):
+        expr = args[0]
+        return NOT(expr)
+
+    def proximity_op(self, args):
+        left, right = args
+        return ProximityEntry(left, right, distance=self.current_prox_distance)
+
+    def PROX(self, token):
+        self.current_prox_distance = int(token[1:])
+        return token
+
+    def word_term(self, args):
+        word = args[0]
+        return Entry(word)
+
+    def quoted_term(self, args):
+        phrase = args[0][1:-1]
+        return Entry(phrase)
+
+    def group(self, args):
+        return args[0]
+
+    def NUMBER(self, token):
+        return int(token)
+
+    def WORD(self, token):
+        word = str(token)
+        if self.ignore_case:
+            word = word.lower()
+        if self.ignore_accent:
+            word = unidecode(word)
+        return word
+
+    def QUOTED_STRING(self, token):
+        text = str(token)
+        if self.ignore_case:
+            text = text.lower()
+        if self.ignore_accent:
+            text = unidecode(text)
+        return text
+
+
+def parse_main_query(query_str, ignore_case=True, ignore_accent=True):
+    parser = Lark(grammar, start="start", parser="lalr")
+    transformer = QueryTransformer(ignore_case=ignore_case, ignore_accent=ignore_accent)
+    tree = parser.parse(query_str)
+    query_obj = transformer.transform(tree)
+    return query_obj
+
+
+def parse_query(query, ignore_case=True, ignore_accent=True):
+    if ignore_accent:
+        query = unidecode(query)
+    return parse_main_query(query, ignore_case, ignore_accent)
 
 
 class Query:
-    def __init__(
-        self,
-        query,
-        ignore_case=True,
-        ignore_accent=True,
-        match_word=True
-    ):
+    def __init__(self, query, ignore_case=True, ignore_accent=True, match_word=True):
         self.ignore_case = ignore_case
         self.ignore_accent = ignore_accent
         self.match_word = match_word
@@ -44,84 +152,3 @@ class Query:
 
     def __repr__(self):
         return self.query.__repr__()
-
-
-def parse_query(query, ignore_case=True, ignore_accent=True):
-    # remove brackets around query
-    if query[0] == '(' and query[-1] == ')':
-        query = strip_brackets(query)
-    # if there are quotes around query, make an entry
-    if query[0] == '"' and query[-1] == '"' and query.count('"') == 1:
-        if ignore_case:
-            query = query.lower()
-        if ignore_accent:
-            query = unidecode(query)
-        return Entry(query)
-
-    # find all operators
-    match = []
-    match_iter = re.finditer(r" (AND NOT|AND|OR) ", query, re.IGNORECASE)
-    for m in match_iter:
-        start = m.start(0)
-        end = m.end(0)
-        operator = query[start+1:end-1].lower()
-        match_item = (start, end)
-        match.append((operator, match_item))
-    match_len = len(match)
-
-    if match_len != 0:
-        # stop at first balanced operation
-        for i, (operator, (start, end)) in enumerate(match):
-            left_part = query[:start]
-            if not is_balanced(left_part):
-                continue
-
-            right_part = query[end:]
-            if not is_balanced(right_part):
-                raise ValueError("Query malformed")
-            break
-
-        if operator == "or":
-            return OR(
-                parse_query(left_part, ignore_case, ignore_accent),
-                parse_query(right_part, ignore_case, ignore_accent)
-            )
-        elif operator == "and":
-            return AND(
-                parse_query(left_part, ignore_case, ignore_accent),
-                parse_query(right_part, ignore_case, ignore_accent)
-            )
-        elif operator == "and not":
-            return ANDNOT(
-                parse_query(left_part, ignore_case, ignore_accent),
-                parse_query(right_part, ignore_case, ignore_accent)
-            )
-    else:
-        if ignore_case:
-            query = query.lower()
-        if ignore_accent:
-            query = unidecode(query)
-        return Entry(query)
-
-
-def strip_brackets(query):
-    count_left = 0
-    for i in range(len(query) - 1):
-        letter = query[i]
-        if letter == "(":
-            count_left += 1
-        elif letter == ")":
-            count_left -= 1
-        if i > 0 and count_left == 0:
-            return query
-
-    if query[0] == "(" and query[-1] == ")":
-        return query[1:-1]
-    return query
-
-
-def is_balanced(query):
-    # are brackets balanced
-    brackets_b = query.count("(") == query.count(")")
-    quotes_b = query.count('"') % 2 == 0
-    return brackets_b and quotes_b

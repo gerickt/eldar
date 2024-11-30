@@ -41,6 +41,23 @@ class Entry:
 
         return res
 
+    def search(self, index):
+        if self.rgx:
+            # Si hay comodines, buscamos todos los términos que coincidan con el patrón
+            matching_terms = [
+                term for term in index._index.keys() if self.rgx.match(term)
+            ]
+            result_ids = set()
+            for term in matching_terms:
+                items = index._index.get(term, set())
+                result_ids.update([item.id for item in items])
+            return result_ids
+        else:
+            # Búsqueda exacta del término
+            items = index._index.get(self.query, set())
+            result_ids = set([item.id for item in items])
+            return result_ids
+
     def __repr__(self):
         if self.not_:
             return f'NOT "{self.query}"'
@@ -52,8 +69,7 @@ class IndexEntry:
         self.not_ = False
 
         if query_term == "*":
-            raise ValueError(
-                "Single character wildcards * are not implemented")
+            raise ValueError("Single character wildcards * are not implemented")
 
         query_term = strip_quotes(query_term)
         if " " in query_term:  # multiword query
@@ -104,6 +120,65 @@ class IndexEntry:
         if self.not_:
             return f'NOT "{self.query_term}"'
         return f'"{self.query_term}"'
+
+
+class ProximityEntry:
+    def __init__(self, left, right, distance):
+        self.left = left
+        self.right = right
+        self.distance = distance
+
+    def evaluate(self, doc):
+        # Tokenizar el documento manteniendo las posiciones
+        tokens = doc.split()
+        positions_left = [
+            i for i, token in enumerate(tokens) if self.left.evaluate(token)
+        ]
+        positions_right = [
+            i for i, token in enumerate(tokens) if self.right.evaluate(token)
+        ]
+
+        # Verificar si alguna pareja de posiciones cumple con la distancia
+        for pos_left in positions_left:
+            for pos_right in positions_right:
+                if abs(pos_left - pos_right) <= self.distance:
+                    return True
+        return False
+
+    def search(self, index):
+        # Obtener los items para los términos izquierdo y derecho
+        left_items = index._index.get(self.left.query, set())
+        right_items = index._index.get(self.right.query, set())
+
+        # Crear diccionarios para mapear IDs de documentos a posiciones
+        left_positions = defaultdict(list)
+        for item in left_items:
+            left_positions[item.id].append(item.position)
+
+        right_positions = defaultdict(list)
+        for item in right_items:
+            right_positions[item.id].append(item.position)
+
+        result_ids = set()
+
+        # Encontrar documentos que contengan ambos términos a la distancia especificada
+        common_doc_ids = set(left_positions.keys()) & set(right_positions.keys())
+        for doc_id in common_doc_ids:
+            left_pos = left_positions[doc_id]
+            right_pos = right_positions[doc_id]
+            for lp in left_pos:
+                for rp in right_pos:
+                    if abs(lp - rp) <= self.distance:
+                        result_ids.add(doc_id)
+                        break  # Ya encontramos una coincidencia en este documento
+                else:
+                    continue
+                break
+
+        return result_ids
+
+    def __repr__(self):
+        return f"({self.left}) /{self.distance} ({self.right})"
 
 
 def strip_quotes(query):
